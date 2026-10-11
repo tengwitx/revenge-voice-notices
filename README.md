@@ -27,7 +27,7 @@ The build produces `dist/manifest.json`, `dist/index.js`, `dist/join.wav`, and `
 
 ## Install
 
-1. Copy the install URL: **https://tengwitx.github.io/revenge-voice-notices/**.
+1. Copy the install URL: **https://raw.githubusercontent.com/tengwitx/revenge-voice-notices/plugin/**.
 2. In Revenge, open Settings → Plugins → Add and paste that folder URL, ending in `/`.
 3. Enable **Voice Notices**, open its settings, and configure **Yourself** and **Other members**.
 4. For an individual override, enable Discord Developer Mode, copy the person's user ID, paste it under **Individual user overrides**, and tap **Add user**.
@@ -35,7 +35,9 @@ The build produces `dist/manifest.json`, `dist/index.js`, `dist/join.wav`, and `
 
 Source repository: [tengwitx/revenge-voice-notices](https://github.com/tengwitx/revenge-voice-notices).
 
-Every push to `main` builds and tests the plugin, then publishes the four output files to GitHub Pages. Publishing runs only if the tests pass. The `dist/` folder is generated automatically and is not committed.
+The `main` branch contains the source. The `plugin` branch contains the four tested installation files. The `dist/` folder is generated locally and is not committed to `main`.
+
+GitHub Actions could not run because GitHub reported an account billing lock. This install URL serves the published files directly and does not depend on Actions or GitHub Pages. Source changes do not publish automatically: build and test, then update the four files on the `plugin` branch to release an update.
 
 ## Compatibility and checks
 
