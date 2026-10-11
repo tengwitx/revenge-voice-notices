@@ -60,10 +60,68 @@
     };
   }
 
+  // src/sounds.js
+  var voiceSound = /^(?:(?:halloween|winter|snowsgiving)_)?(?:user_join|user_leave|user_moved|disconnect|reconnect)(?:_(?:halloween|winter|snowsgiving))?$/i;
+  function isVoiceSound(name) {
+    if (typeof name !== "string") return false;
+    const filename = name.split(/[?#]/)[0].split(/[\\/]/).pop().replace(/\.(mp3|ogg|wav)$/i, "");
+    return voiceSound.test(filename);
+  }
+  function installVoiceSoundGuard(api) {
+    const unpatch = [];
+    const names = /* @__PURE__ */ new Map();
+    let blocked = 0;
+    let prototypeGuard = false;
+    let nativeGuard = false;
+    const stop = () => {
+      for (const undo of unpatch.splice(0).reverse()) undo();
+      names.clear();
+    };
+    try {
+      const prototype = api.metro.findByProps("MobileAudioSound")?.MobileAudioSound?.prototype;
+      if (typeof prototype?.play === "function") {
+        for (const method of ["play", "loop", "playWithListener"]) {
+          if (typeof prototype[method] !== "function") continue;
+          unpatch.push(api.patcher.instead(method, prototype, function(args, original) {
+            if (!isVoiceSound(this.name)) return original(...args);
+            blocked++;
+            return method === "playWithListener" ? Promise.resolve(true) : void 0;
+          }));
+        }
+        prototypeGuard = true;
+      }
+      const native = api.metro.common.ReactNative.NativeModules.DCDSoundManager;
+      if (["prepare", "play", "release"].every((method) => typeof native?.[method] === "function")) {
+        unpatch.push(api.patcher.before("prepare", native, ([name, , key]) => {
+          if (isVoiceSound(name)) names.set(key, name);
+          else names.delete(key);
+        }));
+        unpatch.push(api.patcher.instead("play", native, (args, original) => {
+          if (!names.has(args[0])) return original(...args);
+          blocked++;
+        }));
+        unpatch.push(api.patcher.before("release", native, ([key]) => {
+          names.delete(key);
+        }));
+        nativeGuard = true;
+      }
+    } catch (error) {
+      stop();
+      throw new Error(`Voice Notices could not intercept Discord sounds: ${error.message}`);
+    }
+    if (!prototypeGuard && !nativeGuard) {
+      throw new Error("Voice Notices cannot mute Discord sounds on this version. Required sound APIs were not found.");
+    }
+    return {
+      stop,
+      describe: () => `${prototypeGuard ? "Discord voice sound interception installed" : "Native fallback installed: restart Discord with this plugin enabled to capture cached sounds"}. Blocked: ${blocked}.`
+    };
+  }
+
   // src/index.jsx
   var { React, ReactNative, FluxDispatcher } = vendetta.metro.common;
   var { findByStoreName } = vendetta.metro;
-  var { storage, id } = vendetta.plugin;
+  var { storage, id, manifest } = vendetta.plugin;
   var { Forms } = vendetta.ui.components;
   var { showToast } = vendetta.ui.toasts;
   var { ScrollView } = ReactNative;
@@ -71,6 +129,7 @@
   var cleanup = () => {
   };
   var soundStatus = "Sound has not been initialized.";
+  var guardStatus = () => "Discord voice sound interception is not active.";
   function RuleSettings({ title, rule, onChange }) {
     return /* @__PURE__ */ React.createElement(FormSection, { title }, [["join", "Notify on join"], ["leave", "Notify on leave"], ["sound", "Play notification sound"]].map(
       ([key, label]) => /* @__PURE__ */ React.createElement(FormSwitchRow, { key, label, value: rule[key], onValueChange: (value) => onChange({ ...rule, [key]: value }) })
@@ -80,8 +139,9 @@
     vendetta.storage.useProxy(storage);
     const [userId, setUserId] = React.useState("");
     const [error, setError] = React.useState("");
+    const [, refreshStatus] = React.useState(0);
     const userStore = findByStoreName("UserStore");
-    return /* @__PURE__ */ React.createElement(ScrollView, { contentContainerStyle: { paddingBottom: 32 } }, /* @__PURE__ */ React.createElement(FormSection, { title: "Voice Notices" }, /* @__PURE__ */ React.createElement(FormText, null, "Notices appear inside Discord for your current voice channel. Sound switches control this plugin's sounds only; Discord's own sounds are unchanged."), /* @__PURE__ */ React.createElement(FormText, null, soundStatus)), ["self", "others"].map((key) => /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement(ScrollView, { contentContainerStyle: { paddingBottom: 32 } }, /* @__PURE__ */ React.createElement(FormSection, { title: `Voice Notices ${manifest.version}` }, /* @__PURE__ */ React.createElement(FormText, null, "Discord's original join, leave, move, disconnect, and reconnect sounds are intercepted. Enable Play notification sound to hear this plugin's replacement for the selected users. Other Discord sounds are unchanged."), /* @__PURE__ */ React.createElement(FormText, null, guardStatus()), /* @__PURE__ */ React.createElement(FormText, null, soundStatus), /* @__PURE__ */ React.createElement(FormRow, { label: "Refresh sound status", onPress: () => refreshStatus((value) => value + 1) })), ["self", "others"].map((key) => /* @__PURE__ */ React.createElement(
       RuleSettings,
       {
         key,
@@ -137,6 +197,8 @@
     if (!users?.getCurrentUser || !voices?.getVoiceStatesForChannel || !selected?.getVoiceChannelId || !channelStore?.getChannel) {
       throw new Error("Voice Notices: this Discord version does not expose the required voice stores.");
     }
+    const guard = installVoiceSoundGuard(vendetta);
+    guardStatus = guard.describe;
     let tracker;
     let selfId;
     let active = true;
@@ -194,6 +256,8 @@
     }
     cleanup = () => {
       active = false;
+      guard.stop();
+      guardStatus = () => "Discord voice sound interception is not active.";
       clearTimeout(resetTimer);
       FluxDispatcher.unsubscribe("VOICE_STATE_UPDATES", onStates);
       FluxDispatcher.unsubscribe("CONNECTION_OPEN", onReconnect);
@@ -202,7 +266,12 @@
       ready.clear();
       prepared.clear();
     };
-    reset();
+    try {
+      reset();
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
     FluxDispatcher.subscribe("VOICE_STATE_UPDATES", onStates);
     FluxDispatcher.subscribe("CONNECTION_OPEN", onReconnect);
     FluxDispatcher.subscribe("CONNECTION_RESUMED", onReconnect);
