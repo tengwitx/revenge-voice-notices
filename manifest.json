@@ -1,0 +1,12 @@
+{
+  "name": "Voice Notices",
+  "description": "Configure voice join and leave notices for yourself, other members, and individual users, with optional sound.",
+  "authors": [
+    {
+      "name": "Teng"
+    }
+  ],
+  "version": "1.0.0",
+  "main": "index.js",
+  "hash": "33cad5cdcc97ffc936f9c3da715dfa9d20d0cc12a83892eac2035618380708aa"
+}
