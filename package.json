@@ -1,6 +1,6 @@
 {
   "name": "revenge-voice-notices",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "test": "node --test"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "spitroast": "^1.4.4"
   }
 }

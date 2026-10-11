@@ -1,8 +1,9 @@
 import { createTracker, defaultRule, ruleFor } from "./events.js";
+import { installVoiceSoundGuard } from "./sounds.js";
 
 const { React, ReactNative, FluxDispatcher } = vendetta.metro.common;
 const { findByStoreName } = vendetta.metro;
-const { storage, id } = vendetta.plugin;
+const { storage, id, manifest } = vendetta.plugin;
 const { Forms } = vendetta.ui.components;
 const { showToast } = vendetta.ui.toasts;
 const { ScrollView } = ReactNative;
@@ -10,6 +11,7 @@ const { FormSection, FormSwitchRow, FormInput, FormRow, FormText } = Forms;
 
 let cleanup = () => {};
 let soundStatus = "Sound has not been initialized.";
+let guardStatus = () => "Discord voice sound interception is not active.";
 
 function RuleSettings({ title, rule, onChange }) {
     return <FormSection title={title}>
@@ -23,11 +25,14 @@ function Settings() {
     vendetta.storage.useProxy(storage);
     const [userId, setUserId] = React.useState("");
     const [error, setError] = React.useState("");
+    const [, refreshStatus] = React.useState(0);
     const userStore = findByStoreName("UserStore");
     return <ScrollView contentContainerStyle={{ paddingBottom: 32 }}>
-        <FormSection title="Voice Notices">
-            <FormText>Notices appear inside Discord for your current voice channel. Sound switches control this plugin's sounds only; Discord's own sounds are unchanged.</FormText>
+        <FormSection title={`Voice Notices ${manifest.version}`}>
+            <FormText>Discord's original join, leave, move, disconnect, and reconnect sounds are intercepted. Enable Play notification sound to hear this plugin's replacement for the selected users. Other Discord sounds are unchanged.</FormText>
+            <FormText>{guardStatus()}</FormText>
             <FormText>{soundStatus}</FormText>
+            <FormRow label="Refresh sound status" onPress={() => refreshStatus(value => value + 1)} />
         </FormSection>
         {["self", "others"].map(key => <RuleSettings key={key} title={key === "self" ? "Yourself" : "Other members"}
             rule={storage[key] ?? defaultRule} onChange={rule => { storage[key] = rule; }} />)}
@@ -68,6 +73,8 @@ function onLoad() {
     if (!users?.getCurrentUser || !voices?.getVoiceStatesForChannel || !selected?.getVoiceChannelId || !channelStore?.getChannel) {
         throw new Error("Voice Notices: this Discord version does not expose the required voice stores.");
     }
+    const guard = installVoiceSoundGuard(vendetta);
+    guardStatus = guard.describe;
 
     let tracker;
     let selfId;
@@ -132,6 +139,8 @@ function onLoad() {
 
     cleanup = () => {
         active = false;
+        guard.stop();
+        guardStatus = () => "Discord voice sound interception is not active.";
         clearTimeout(resetTimer);
         FluxDispatcher.unsubscribe("VOICE_STATE_UPDATES", onStates);
         FluxDispatcher.unsubscribe("CONNECTION_OPEN", onReconnect);
@@ -141,7 +150,12 @@ function onLoad() {
         prepared.clear();
     };
 
-    reset();
+    try {
+        reset();
+    } catch (error) {
+        cleanup();
+        throw error;
+    }
     FluxDispatcher.subscribe("VOICE_STATE_UPDATES", onStates);
     FluxDispatcher.subscribe("CONNECTION_OPEN", onReconnect);
     FluxDispatcher.subscribe("CONNECTION_RESUMED", onReconnect);
