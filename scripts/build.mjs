@@ -4,8 +4,8 @@ import { createHash } from "node:crypto";
 
 await mkdir("dist", { recursive: true });
 const result = await build({
-    entryPoints: ["src/index.jsx"], bundle: true, write: false, format: "iife",
-    globalName: "voiceNotices", target: "es2020", jsxFactory: "React.createElement", jsxFragment: "React.Fragment"
+    entryPoints: ["src/index.js"], bundle: true, write: false, format: "iife",
+    globalName: "voiceNotices", target: "es2020"
 });
 const script = `(() => {${result.outputFiles[0].text}\nreturn voiceNotices.default;})()`;
 await writeFile("dist/index.js", script);

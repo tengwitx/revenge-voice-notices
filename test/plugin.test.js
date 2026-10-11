@@ -2,291 +2,222 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { build } from "esbuild";
 import { createHash } from "node:crypto";
 import patcher from "spitroast";
 
-const { before, instead } = patcher;
+const source = await readFile("dist/index.js", "utf8");
+const methods = ["play", "loop", "playWithListener"];
 
-const output = await build({ entryPoints: ["src/index.jsx"], bundle: true, write: false, format: "iife", globalName: "voiceNotices", jsxFactory: "React.createElement", jsxFragment: "React.Fragment" });
-const source = `(() => {${output.outputFiles[0].text}; return voiceNotices.default;})()`;
-
-function harness({ withSound = true, deferSound = false, withPrototype = true, withMetadata = true, prepareError = null } = {}) {
-    const handlers = new Map();
-    const toasts = [], played = [], stopped = [], released = [], timers = new Map(), callbacks = [], builtinPlayed = [], preparedCalls = [];
+function harness({ missingPlayer = false, failPatchAt = 0 } = {}) {
+    const prepared = [], played = [];
+    let nextKey = 0;
+    const resources = new Map();
+    const native = {
+        prepare(name, key) { prepared.push(name); resources.set(key, name); },
+        play(key) { played.push(resources.get(key)); }
+    };
     class MobileAudioSound {
-        constructor(name) { this.name = name; }
-        play() { builtinPlayed.push(this.name); }
-        loop() { builtinPlayed.push(this.name); }
-        playWithListener() { builtinPlayed.push(this.name); return Promise.resolve(true); }
-    }
-    const cachedJoin = new MobileAudioSound("user_join");
-    let timerId = 0;
-    const storage = {};
-    const sound = {
-        prepare(url, category, id, callback) {
-            preparedCalls.push({ name: url, usage: category, id });
-            if (id >= 1_000_000_000) {
-                assert.ok(["user_join", "user_leave"].includes(url));
-                assert.equal(category, "voice");
+        constructor(name) { this.name = name; this.volume = 0.35; }
+        ensureSound() {
+            if (!this.soundPromise) {
+                const key = ++nextKey;
+                native.prepare(this.name, key);
+                this.soundPromise = Promise.resolve({ play: () => native.play(key), volume: this.volume });
             }
-            assert.equal(Number.isInteger(id), true);
-            assert.ok(id > 0 && id < 2147483647);
-            const finish = () => callback(prepareError, withMetadata ? { duration: 0.16 } : undefined);
-            if (deferSound) callbacks.push(finish);
-            else finish();
-        },
-        play: id => played.push(id), stop: id => stopped.push(id), release: id => released.push(id)
-    };
-    const stores = {
-        UserStore: { getCurrentUser: () => ({ id: "me" }), getUser: id => ({ username: id }) },
-        VoiceStateStore: { getVoiceStatesForChannel: () => ({ friend: { userId: "friend", channelId: "a" } }) },
-        SelectedChannelStore: { getVoiceChannelId: () => "a" },
-        ChannelStore: { getChannel: id => ({ name: `room-${id}` }) }
-    };
-    const plugin = vm.runInNewContext(source, {
-        vendetta: {
-            metro: { common: { React: {
-                createElement: (type, props, ...children) => typeof type === "function" ? type({ ...props, children }) : { type, props: { ...props, children } },
-                useState: value => [value, () => {}]
-            }, ReactNative: { NativeModules: withSound ? { DCDSoundManager: sound } : {} }, FluxDispatcher: {
-                subscribe: (event, handler) => { assert.equal(handlers.has(event), false); handlers.set(event, handler); },
-                unsubscribe: (event, handler) => { if (handlers.get(event) === handler) handlers.delete(event); }
-            } }, findByStoreName: name => stores[name], findByProps: () => withPrototype ? { MobileAudioSound } : undefined },
-            patcher: { before, instead },
-            plugin: { storage, id: "https://example.com/voice-notices/", manifest: { version: "1.2.0" } },
-            storage: { useProxy() {} },
-            ui: { components: { Forms: Object.fromEntries(["FormRow", "FormSection", "FormSwitchRow", "FormInput", "FormText"].map(name => [name, name])) }, toasts: { showToast: text => toasts.push(text) } },
-            logger: { warn() {}, error() {} }
-        },
-        setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
-        clearTimeout: id => timers.delete(id)
-    });
-    const dispatch = (event, payload = {}) => handlers.get(event)?.(payload);
-    const flush = () => { for (const [id, callback] of [...timers]) { timers.delete(id); callback(); } };
-    const rows = () => {
-        const found = [];
-        function visit(node) {
-            if (!node || typeof node !== "object") return;
-            if (Array.isArray(node)) return node.forEach(visit);
-            if (node.type === "FormRow") found.push(node.props);
-            visit(node.props?.children);
+            return this.soundPromise;
         }
-        visit(plugin.settings());
-        return found;
+        play() { this.ensureSound().then(sound => sound.play()); }
+        loop() { this.ensureSound().then(sound => { sound.numberOfLoops = -1; sound.play(); }); }
+        playWithListener() { return this.ensureSound().then(sound => { sound.play(); return true; }); }
+    }
+    const originals = Object.fromEntries(methods.map(method => [method, MobileAudioSound.prototype[method]]));
+    let patches = 0;
+    const api = {
+        metro: {
+            findByProps(name) {
+                assert.equal(name, "MobileAudioSound");
+                return missingPlayer ? undefined : { MobileAudioSound };
+            }
+        },
+        patcher: {
+            instead(...args) {
+                if (++patches === failPatchAt) throw new Error("Patch installation failed");
+                return patcher.instead(...args);
+            }
+        }
     };
-    return { plugin, storage, toasts, played, stopped, released, handlers, dispatch, flush, callbacks, stores, sound, MobileAudioSound, cachedJoin, builtinPlayed, preparedCalls, rows };
+    const evaluate = () => vm.runInNewContext(source, { vendetta: api });
+    return {
+        plugin: evaluate(), evaluate, api, MobileAudioSound, originals, prepared, played,
+        flush: () => new Promise(resolve => setImmediate(resolve)),
+        assertRestored() {
+            for (const method of methods) assert.equal(MobileAudioSound.prototype[method], originals[method]);
+        }
+    };
 }
 
-test("regression: sounds use bundled Discord resources on the voice audio route", () => {
+test("plugin exposes only enable/disable and requires no UI, storage, or voice stores", () => {
     const h = harness();
+    assert.deepEqual(Object.keys(h.plugin).sort(), ["onLoad", "onUnload"]);
     h.plugin.onLoad();
-    assert.deepEqual(h.preparedCalls.map(({ name, usage }) => ({ name, usage })), [
-        { name: "user_join", usage: "voice" }, { name: "user_leave", usage: "voice" }
-    ]);
-    h.storage.others.sound = true;
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
-    assert.deepEqual(h.played, [h.preparedCalls[1].id]);
+    assert.equal(h.prepared.length, 0);
+    assert.equal(h.played.length, 0);
     h.plugin.onUnload();
+    h.assertRestored();
 });
 
-test("regression: switching sound off, on, and off again works without restarting", () => {
+test("enabled plugin blocks cached and new voice sounds on every playback path", async () => {
     const h = harness();
+    const cached = new h.MobileAudioSound("user_join");
+    const cachedResource = await cached.ensureSound();
     h.plugin.onLoad();
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
-    assert.equal(h.played.length, 0);
-    h.storage.others.sound = true;
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: "a" }] });
-    assert.deepEqual(h.played, [h.preparedCalls[0].id]);
-    h.storage.others.sound = false;
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
-    assert.equal(h.played.length, 1);
-    h.plugin.onUnload();
-});
-
-test("regression: successful preparation without metadata still enables sound", () => {
-    const h = harness({ withMetadata: false });
-    h.plugin.onLoad();
-    h.storage.self.sound = true;
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "me", channelId: null }] });
-    assert.deepEqual(h.played, [h.preparedCalls[1].id]);
-    h.plugin.onUnload();
-});
-
-test("regression: settings test buttons bypass muted preferences but not the readiness check", () => {
-    const h = harness({ deferSound: true });
-    h.plugin.onLoad();
-    const join = h.rows().find(row => row.label === "Test join sound");
-    join.onPress();
-    assert.equal(h.played.length, 0);
-    assert.match(h.toasts.at(-1), /Loading/);
-    h.callbacks.forEach(callback => callback());
-    join.onPress();
-    h.rows().find(row => row.label === "Test leave sound").onPress();
-    assert.deepEqual(h.played, h.preparedCalls.map(call => call.id));
-    assert.equal(h.storage.self.sound, false);
-    assert.equal(h.storage.others.sound, false);
-    h.plugin.onUnload();
-    join.onPress();
-    assert.equal(h.played.length, 2);
-    assert.match(h.toasts.at(-1), /not enabled/);
-});
-
-test("regression: failed preparation is visible from the sound test button", () => {
-    const h = harness({ prepareError: "Resource unavailable" });
-    h.plugin.onLoad();
-    h.rows().find(row => row.label === "Test join sound").onPress();
-    assert.equal(h.played.length, 0);
-    assert.match(h.toasts.at(-1), /could not load/);
-    h.plugin.onUnload();
-});
-
-test("regression: cached Discord voice sounds are blocked, unrelated sounds are preserved", async () => {
-    const h = harness();
-    h.plugin.onLoad();
-    h.cachedJoin.play();
+    cached.play();
     for (const name of ["user_join", "user_leave", "user_moved", "disconnect", "reconnect", "halloween_user_join", "winter_user_leave"]) {
         const audio = new h.MobileAudioSound(name);
         audio.play();
         audio.loop();
         assert.equal(await audio.playWithListener(), true);
+        assert.equal(audio.soundPromise, undefined);
     }
-    assert.deepEqual(h.builtinPlayed, []);
-    for (const name of ["message1", "call_ringing", "mute", "unmute", "deafen", "stream_user_joined", "activity_user_join"]) {
-        new h.MobileAudioSound(name).play();
-    }
-    assert.deepEqual(h.builtinPlayed, ["message1", "call_ringing", "mute", "unmute", "deafen", "stream_user_joined", "activity_user_join"]);
+    await h.flush();
+    assert.deepEqual(h.played, []);
+    assert.deepEqual(h.prepared, ["user_join"]);
+    assert.equal(await cached.ensureSound(), cachedResource);
+    assert.equal(cached.volume, 0.35);
     h.plugin.onUnload();
-    h.cachedJoin.play();
-    assert.equal(h.builtinPlayed.at(-1), "user_join");
+    h.assertRestored();
 });
 
-test("regression: native playback of prepared Discord voice sounds is blocked, including reused keys", () => {
-    const h = harness({ withPrototype: false });
+test("disabling restores cached sound playback immediately without reloading audio", async () => {
+    const h = harness();
+    const audio = new h.MobileAudioSound("user_leave");
+    const resource = await audio.ensureSound();
     h.plugin.onLoad();
-    h.sound.prepare("user_join", "voice", 10, () => {});
-    h.sound.prepare("user_leave", "voice", 11, () => {});
-    h.sound.prepare("message1", "notification", 12, () => {});
-    h.sound.play(10);
-    h.sound.play(11);
-    h.sound.play(12);
-    assert.deepEqual(h.played, [12]);
-    h.sound.release(10);
-    h.sound.prepare("mute", "voice", 10, () => {});
-    h.sound.play(10);
-    h.sound.prepare("user_join", "voice", 20, () => {});
-    h.sound.prepare("message1", "notification", 20, () => {});
-    h.sound.play(20);
-    assert.deepEqual(h.played, [12, 10, 20]);
+    audio.play();
+    await h.flush();
+    assert.equal(h.played.length, 0);
     h.plugin.onUnload();
-    h.sound.play(11);
-    assert.equal(h.played.at(-1), 11);
+    h.assertRestored();
+    for (const method of methods) await audio[method]();
+    await h.flush();
+    assert.deepEqual(h.played, ["user_leave", "user_leave", "user_leave"]);
+    assert.deepEqual(h.prepared, ["user_leave"]);
+    assert.equal(await audio.ensureSound(), resource);
+    assert.equal(resource.volume, 0.35);
 });
 
-test("regression: selective replacement sound respects per-user silence while Discord sound stays blocked", () => {
+test("repeated on/off cycles keep restoring original sounds with no stacked patches", async () => {
+    const h = harness();
+    const audio = new h.MobileAudioSound("user_join");
+    await audio.ensureSound();
+    for (let cycle = 0; cycle < 10; cycle++) {
+        h.plugin.onLoad();
+        h.plugin.onLoad();
+        audio.play();
+        await h.flush();
+        assert.equal(h.played.length, cycle);
+        h.plugin.onUnload();
+        h.plugin.onUnload();
+        h.assertRestored();
+        audio.play();
+        await h.flush();
+        assert.equal(h.played.length, cycle + 1);
+    }
+    assert.equal(h.prepared.length, 1);
+});
+
+test("Revenge-style fresh plugin evaluation on each enable preserves cached instances", async () => {
+    const h = harness();
+    const cached = new h.MobileAudioSound("disconnect");
+    await cached.ensureSound();
+    for (let cycle = 0; cycle < 5; cycle++) {
+        const plugin = h.evaluate();
+        plugin.onLoad();
+        cached.play();
+        await h.flush();
+        assert.equal(h.played.length, cycle);
+        plugin.onUnload();
+        h.assertRestored();
+        cached.play();
+        await h.flush();
+        assert.equal(h.played.length, cycle + 1);
+    }
+});
+
+test("unrelated Discord sounds retain original asynchronous playback", async () => {
+    const h = harness();
+    const names = ["message1", "call_ringing", "mute", "unmute", "deafen", "undeafen", "stream_user_joined", "activity_user_join", "custom_sound"];
+    h.plugin.onLoad();
+    for (const name of names) {
+        const audio = new h.MobileAudioSound(name);
+        audio.play();
+        audio.loop();
+        assert.equal(await audio.playWithListener(), true);
+    }
+    await h.flush();
+    assert.deepEqual(h.played, names.flatMap(name => [name, name, name]));
+    h.plugin.onUnload();
+    h.assertRestored();
+});
+
+test("muted playWithListener still completes its caller's callback", async () => {
     const h = harness();
     h.plugin.onLoad();
-    h.storage.others.sound = true;
-    h.storage.users.friend = { join: true, leave: true, sound: false };
-    new h.MobileAudioSound("user_leave").play();
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
-    assert.deepEqual(h.builtinPlayed, []);
-    assert.equal(h.played.length, 0);
-    assert.equal(h.toasts.length, 1);
+    let completed = false;
+    await new h.MobileAudioSound("user_join").playWithListener().then(result => { completed = result; });
+    assert.equal(completed, true);
+    assert.deepEqual(h.played, []);
+    h.plugin.onUnload();
+});
+
+test("missing sound API fails explicitly and leaves playback untouched", () => {
+    const h = harness({ missingPlayer: true });
+    assert.throws(() => h.plugin.onLoad(), /MobileAudioSound.play was not found/);
+    h.plugin.onUnload();
+    h.assertRestored();
+});
+
+test("partially installed patches are removed when enabling fails", async () => {
+    const h = harness({ failPatchAt: 2 });
+    assert.throws(() => h.plugin.onLoad(), /could not intercept Discord sounds/);
+    h.plugin.onUnload();
+    h.assertRestored();
     new h.MobileAudioSound("user_join").play();
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "stranger", channelId: "a" }] });
-    assert.deepEqual(h.builtinPlayed, []);
-    assert.equal(h.played.length, 1);
-    h.plugin.onUnload();
+    await h.flush();
+    assert.deepEqual(h.played, ["user_join"]);
 });
 
-test("regression: unsupported sound APIs fail explicitly before registering listeners", () => {
-    const h = harness({ withSound: false, withPrototype: false });
-    assert.throws(() => h.plugin.onLoad(), /cannot mute Discord sounds/);
-    assert.equal(h.handlers.size, 0);
-});
-
-test("regression: repeated enable does not stack patches and unload restores playback", () => {
+test("failed re-enable removes the preceding plugin instance's interception", async () => {
     const h = harness();
     h.plugin.onLoad();
-    h.plugin.onLoad();
-    h.cachedJoin.play();
-    assert.equal(h.builtinPlayed.length, 0);
+    h.api.metro.findByProps = () => undefined;
+    assert.throws(() => h.plugin.onLoad(), /MobileAudioSound.play was not found/);
+    h.assertRestored();
+    new h.MobileAudioSound("user_join").play();
+    await h.flush();
+    assert.deepEqual(h.played, ["user_join"]);
     h.plugin.onUnload();
-    h.cachedJoin.play();
-    assert.equal(h.builtinPlayed.length, 1);
-    assert.equal(h.handlers.size, 0);
 });
 
-test("integration: default notices are silent; preferences and overrides apply immediately", () => {
+test("disabling preserves another plugin's existing patch", async () => {
     const h = harness();
+    let otherCalls = 0;
+    const undoOther = patcher.before("play", h.MobileAudioSound.prototype, () => { otherCalls++; });
     h.plugin.onLoad();
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
-    assert.deepEqual(h.toasts, ["friend left room-a"]);
-    assert.equal(h.played.length, 0);
-    h.storage.others.sound = true;
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: "a" }] });
-    assert.equal(Number.isInteger(h.played[0]), true);
-    h.storage.users.friend = { join: false, leave: false, sound: true };
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
-    assert.equal(h.toasts.length, 2);
-    assert.equal(h.played.length, 1);
+    new h.MobileAudioSound("user_join").play();
+    await h.flush();
+    assert.deepEqual(h.played, []);
     h.plugin.onUnload();
+    new h.MobileAudioSound("user_join").play();
+    await h.flush();
+    assert.deepEqual(h.played, ["user_join"]);
+    assert.equal(otherCalls, 2);
+    undoOther();
+    h.assertRestored();
 });
 
-test("integration: text notices still work without the native sound module", () => {
-    const h = harness({ withSound: false });
-    h.plugin.onLoad();
-    h.storage.others.sound = true;
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
-    assert.equal(h.toasts.length, 1);
-    assert.equal(h.played.length, 0);
-    h.plugin.onUnload();
-});
-
-test("integration: reconnect resets baseline without replaying notices", () => {
-    const h = harness();
-    h.plugin.onLoad();
-    h.dispatch("CONNECTION_RESUMED");
-    h.flush();
-    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: "a" }] });
-    assert.equal(h.toasts.length, 0);
-    h.plugin.onUnload();
-});
-
-test("integration: unloading removes subscriptions and releases prepared sounds", () => {
-    const h = harness();
-    h.plugin.onLoad();
-    assert.equal(h.handlers.size, 3);
-    h.plugin.onUnload();
-    h.flush();
-    assert.equal(h.handlers.size, 0);
-    assert.equal(h.stopped.length, 2);
-    assert.equal(h.released.length, 2);
-    h.plugin.onUnload();
-    assert.equal(h.stopped.length, 2);
-});
-
-test("integration: late preparation callbacks after unload release sounds without playing", () => {
-    const h = harness({ deferSound: true });
-    h.plugin.onLoad();
-    h.plugin.onUnload();
-    h.callbacks.forEach(callback => callback());
-    h.flush();
-    assert.equal(h.released.length, 2);
-    assert.equal(h.played.length, 0);
-});
-
-test("integration: missing required stores fail before registering listeners", () => {
-    const h = harness();
-    delete h.stores.VoiceStateStore.getVoiceStatesForChannel;
-    assert.throws(() => h.plugin.onLoad(), /required voice stores/);
-    assert.equal(h.handlers.size, 0);
-});
-
-test("build: manifest hash is valid and audio uses no remote files", async () => {
+test("published build has the expected manifest version and bundle hash", async () => {
     const manifest = JSON.parse(await readFile("dist/manifest.json", "utf8"));
-    const bundle = await readFile("dist/index.js");
-    assert.equal(manifest.hash, createHash("sha256").update(bundle).digest("hex"));
-    assert.doesNotMatch(bundle.toString(), /join\.wav|leave\.wav/);
+    assert.equal(manifest.version, "2.0.0");
+    assert.equal(manifest.hash, createHash("sha256").update(source).digest("hex"));
 });
