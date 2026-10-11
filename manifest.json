@@ -2,6 +2,6 @@
   "name": "Voice Notices",
   "description": "Enable to mute Discord voice join and leave sounds. Disable to restore normal sounds. No settings needed.",
   "authors": [{ "name": "Teng" }],
-  "version": "2.0.0",
+  "version": "2.0.1",
   "main": "index.js"
 }

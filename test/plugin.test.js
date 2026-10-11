@@ -8,7 +8,7 @@ import patcher from "spitroast";
 const source = await readFile("dist/index.js", "utf8");
 const methods = ["play", "loop", "playWithListener"];
 
-function harness({ missingPlayer = false, failPatchAt = 0 } = {}) {
+function harness({ missingPlayer = false, failPatchAt = 0, failUnpatchAt = 0, retainCallbacks = false } = {}) {
     const prepared = [], played = [];
     let nextKey = 0;
     const resources = new Map();
@@ -32,6 +32,9 @@ function harness({ missingPlayer = false, failPatchAt = 0 } = {}) {
     }
     const originals = Object.fromEntries(methods.map(method => [method, MobileAudioSound.prototype[method]]));
     let patches = 0;
+    let cleanupAttempts = 0;
+    const warnings = [];
+    const retainedCleanup = [];
     const api = {
         metro: {
             findByProps(name) {
@@ -42,13 +45,21 @@ function harness({ missingPlayer = false, failPatchAt = 0 } = {}) {
         patcher: {
             instead(...args) {
                 if (++patches === failPatchAt) throw new Error("Patch installation failed");
-                return patcher.instead(...args);
+                const undo = patcher.instead(...args);
+                retainedCleanup.push(undo);
+                return () => {
+                    if (++cleanupAttempts === failUnpatchAt) throw new Error("Patch removal failed");
+                    if (!retainCallbacks) return undo();
+                };
             }
-        }
+        },
+        logger: { warn: (...args) => warnings.push(args) }
     };
     const evaluate = () => vm.runInNewContext(source, { vendetta: api });
     return {
-        plugin: evaluate(), evaluate, api, MobileAudioSound, originals, prepared, played,
+        plugin: evaluate(), evaluate, api, MobileAudioSound, originals, prepared, played, warnings,
+        get cleanupAttempts() { return cleanupAttempts; },
+        removeRetained() { retainedCleanup.forEach(undo => undo()); },
         flush: () => new Promise(resolve => setImmediate(resolve)),
         assertRestored() {
             for (const method of methods) assert.equal(MobileAudioSound.prototype[method], originals[method]);
@@ -144,6 +155,100 @@ test("Revenge-style fresh plugin evaluation on each enable preserves cached inst
     }
 });
 
+test("overlapping plugin starts do not leave an earlier muting instance behind", async () => {
+    const h = harness();
+    const first = h.evaluate();
+    const second = h.evaluate();
+    try {
+        first.onLoad();
+        second.onLoad();
+        second.onUnload();
+        new h.MobileAudioSound("user_join").play();
+        await h.flush();
+        assert.deepEqual(h.played, ["user_join"]);
+        h.assertRestored();
+    } finally {
+        first.onUnload();
+        second.onUnload();
+    }
+});
+
+test("concurrent Revenge-style async starts followed by one stop restore sound", async () => {
+    const h = harness();
+    const pendingStorage = [];
+    let current;
+    let enabled = false;
+    async function start() {
+        await new Promise(resolve => pendingStorage.push(resolve));
+        current = h.evaluate();
+        current.onLoad();
+        enabled = true;
+    }
+    const first = start();
+    const second = start();
+    assert.equal(enabled, false);
+    pendingStorage.forEach(resolve => resolve());
+    await Promise.all([first, second]);
+    new h.MobileAudioSound("user_join").play();
+    await h.flush();
+    assert.deepEqual(h.played, []);
+    current.onUnload();
+    enabled = false;
+    h.assertRestored();
+    new h.MobileAudioSound("user_join").play();
+    await h.flush();
+    assert.equal(enabled, false);
+    assert.deepEqual(h.played, ["user_join"]);
+});
+
+test("late cleanup from an old instance does not disable the new instance", async () => {
+    const h = harness();
+    const first = h.evaluate();
+    const second = h.evaluate();
+    first.onLoad();
+    second.onLoad();
+    first.onUnload();
+    new h.MobileAudioSound("user_join").play();
+    await h.flush();
+    assert.deepEqual(h.played, []);
+    second.onUnload();
+    h.assertRestored();
+    new h.MobileAudioSound("user_join").play();
+    await h.flush();
+    assert.deepEqual(h.played, ["user_join"]);
+});
+
+test("captured callbacks stop muting after unload even when unpatch does nothing", async () => {
+    const h = harness({ retainCallbacks: true });
+    h.plugin.onLoad();
+    const audio = new h.MobileAudioSound("user_join");
+    const capturedPlay = audio.play.bind(audio);
+    capturedPlay();
+    await h.flush();
+    assert.deepEqual(h.played, []);
+    h.plugin.onUnload();
+    capturedPlay();
+    assert.equal(await audio.playWithListener(), true);
+    await h.flush();
+    assert.deepEqual(h.played, ["user_join", "user_join"]);
+    h.removeRetained();
+    h.assertRestored();
+});
+
+test("one failed unpatch cannot keep muting or prevent the remaining cleanup", async () => {
+    const h = harness({ failUnpatchAt: 1 });
+    h.plugin.onLoad();
+    h.plugin.onUnload();
+    assert.equal(h.cleanupAttempts, 3);
+    assert.equal(h.warnings.length, 1);
+    const audio = new h.MobileAudioSound("user_leave");
+    for (const method of methods) await audio[method]();
+    await h.flush();
+    assert.deepEqual(h.played, ["user_leave", "user_leave", "user_leave"]);
+    h.removeRetained();
+    h.assertRestored();
+});
+
 test("unrelated Discord sounds retain original asynchronous playback", async () => {
     const h = harness();
     const names = ["message1", "call_ringing", "mute", "unmute", "deafen", "undeafen", "stream_user_joined", "activity_user_join", "custom_sound"];
@@ -218,6 +323,6 @@ test("disabling preserves another plugin's existing patch", async () => {
 
 test("published build has the expected manifest version and bundle hash", async () => {
     const manifest = JSON.parse(await readFile("dist/manifest.json", "utf8"));
-    assert.equal(manifest.version, "2.0.0");
+    assert.equal(manifest.version, "2.0.1");
     assert.equal(manifest.hash, createHash("sha256").update(source).digest("hex"));
 });
