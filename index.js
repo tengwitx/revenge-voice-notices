@@ -25,6 +25,7 @@
 
   // src/sounds.js
   var voiceSound = /^(?:(?:halloween|winter|snowsgiving)_)?(?:user_join|user_leave|user_moved|disconnect|reconnect)(?:_(?:halloween|winter|snowsgiving))?$/i;
+  var guardKey = Symbol.for("revenge.voice-notices.sound-guard");
   function isVoiceSound(name) {
     if (typeof name !== "string") return false;
     const filename = name.split(/[?#]/)[0].split(/[\\/]/).pop().replace(/\.(mp3|ogg|wav)$/i, "");
@@ -35,18 +36,29 @@
     if (typeof prototype?.play !== "function") {
       throw new Error("Voice Notices cannot mute Discord sounds on this version: MobileAudioSound.play was not found.");
     }
+    prototype[guardKey]?.();
     const unpatch = [];
+    let active = true;
     const stop = () => {
-      for (const undo of unpatch.splice(0).reverse()) undo();
+      active = false;
+      for (const undo of unpatch.splice(0).reverse()) {
+        try {
+          undo();
+        } catch (error) {
+          api.logger?.warn("Voice Notices could not remove a sound patch", error);
+        }
+      }
+      if (prototype[guardKey] === stop) delete prototype[guardKey];
     };
     try {
       for (const method of ["play", "loop", "playWithListener"]) {
         if (typeof prototype[method] !== "function") continue;
         unpatch.push(api.patcher.instead(method, prototype, function(args, original) {
-          if (!isVoiceSound(this.name)) return original(...args);
+          if (!active || !isVoiceSound(this.name)) return original(...args);
           return method === "playWithListener" ? Promise.resolve(true) : void 0;
         }));
       }
+      Object.defineProperty(prototype, guardKey, { value: stop, configurable: true });
     } catch (error) {
       stop();
       throw new Error(`Voice Notices could not intercept Discord sounds: ${error.message}`);
