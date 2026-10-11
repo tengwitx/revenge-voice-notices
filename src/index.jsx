@@ -3,7 +3,7 @@ import { installVoiceSoundGuard } from "./sounds.js";
 
 const { React, ReactNative, FluxDispatcher } = vendetta.metro.common;
 const { findByStoreName } = vendetta.metro;
-const { storage, id, manifest } = vendetta.plugin;
+const { storage, manifest } = vendetta.plugin;
 const { Forms } = vendetta.ui.components;
 const { showToast } = vendetta.ui.toasts;
 const { ScrollView } = ReactNative;
@@ -12,6 +12,7 @@ const { FormSection, FormSwitchRow, FormInput, FormRow, FormText } = Forms;
 let cleanup = () => {};
 let soundStatus = "Sound has not been initialized.";
 let guardStatus = () => "Discord voice sound interception is not active.";
+let playNotice = () => showToast("Voice Notices is not enabled.");
 
 function RuleSettings({ title, rule, onChange }) {
     return <FormSection title={title}>
@@ -29,10 +30,12 @@ function Settings() {
     const userStore = findByStoreName("UserStore");
     return <ScrollView contentContainerStyle={{ paddingBottom: 32 }}>
         <FormSection title={`Voice Notices ${manifest.version}`}>
-            <FormText>Discord's original join, leave, move, disconnect, and reconnect sounds are intercepted. Enable Play notification sound to hear this plugin's replacement for the selected users. Other Discord sounds are unchanged.</FormText>
+            <FormText>Discord's original voice notices are intercepted. Enable Play notification sound to hear Discord's built-in join and leave sounds for the selected users. No audio download is needed. Other Discord sounds are unchanged.</FormText>
             <FormText>{guardStatus()}</FormText>
             <FormText>{soundStatus}</FormText>
             <FormRow label="Refresh sound status" onPress={() => refreshStatus(value => value + 1)} />
+            <FormRow label="Test join sound" onPress={() => playNotice("join", true)} />
+            <FormRow label="Test leave sound" onPress={() => playNotice("leave", true)} />
         </FormSection>
         {["self", "others"].map(key => <RuleSettings key={key} title={key === "self" ? "Yourself" : "Other members"}
             rule={storage[key] ?? defaultRule} onChange={rule => { storage[key] = rule; }} />)}
@@ -73,9 +76,6 @@ function onLoad() {
     if (!users?.getCurrentUser || !voices?.getVoiceStatesForChannel || !selected?.getVoiceChannelId || !channelStore?.getChannel) {
         throw new Error("Voice Notices: this Discord version does not expose the required voice stores.");
     }
-    const guard = installVoiceSoundGuard(vendetta);
-    guardStatus = guard.describe;
-
     let tracker;
     let selfId;
     let active = true;
@@ -86,6 +86,26 @@ function onLoad() {
     // Native sound IDs are integers; fresh IDs prevent delayed cleanup from releasing a new instance.
     const firstSoundId = 1_000_000_000 + Math.floor(Math.random() * 500_000_000) * 2;
     const soundIds = { join: firstSoundId, leave: firstSoundId + 1 };
+    const guard = installVoiceSoundGuard(vendetta, new Set(Object.values(soundIds)));
+    guardStatus = guard.describe;
+
+    playNotice = (event, testing = false) => {
+        if (!ready.has(event)) {
+            if (testing) showToast(soundStatus);
+            return;
+        }
+        try {
+            Promise.resolve(sound.play(soundIds[event])).catch(error => {
+                soundStatus = "Voice sound playback failed. Restart Discord and try Test join sound.";
+                vendetta.logger.error("Voice Notices sound failed", error);
+                if (testing) showToast(soundStatus);
+            });
+        } catch (error) {
+            soundStatus = "Voice sound playback failed. Restart Discord and try Test join sound.";
+            vendetta.logger.error("Voice Notices sound failed", error);
+            if (testing) showToast(soundStatus);
+        }
+    };
 
     function reset() {
         selfId = users.getCurrentUser()?.id;
@@ -106,13 +126,7 @@ function onLoad() {
             const name = notice.userId === selfId ? "You" : user?.globalName ?? user?.username ?? notice.userId;
             const channel = channelStore.getChannel(notice.channelId)?.name ?? "voice channel";
             showToast(`${name} ${notice.event === "join" ? "joined" : "left"} ${channel}`);
-            if (rule.sound && ready.has(notice.event)) {
-                try {
-                    Promise.resolve(sound.play(soundIds[notice.event])).catch(error => vendetta.logger.error("Voice Notices sound failed", error));
-                } catch (error) {
-                    vendetta.logger.error("Voice Notices sound failed", error);
-                }
-            }
+            if (rule.sound) playNotice(notice.event);
         }
     }
 
@@ -141,6 +155,7 @@ function onLoad() {
         active = false;
         guard.stop();
         guardStatus = () => "Discord voice sound interception is not active.";
+        playNotice = () => showToast("Voice Notices is not enabled.");
         clearTimeout(resetTimer);
         FluxDispatcher.unsubscribe("VOICE_STATE_UPDATES", onStates);
         FluxDispatcher.unsubscribe("CONNECTION_OPEN", onReconnect);
@@ -164,16 +179,16 @@ function onLoad() {
         soundStatus = "Loading notification sounds...";
         for (const event of ["join", "leave"]) {
             try {
-                sound.prepare(`${id}${event}.wav`, "notification", soundIds[event], (error, metadata) => {
-                    if (error || !metadata) {
-                        soundStatus = "Sound could not load. Check that the plugin URL includes join.wav and leave.wav.";
+                sound.prepare(event === "join" ? "user_join" : "user_leave", "voice", soundIds[event], error => {
+                    if (error) {
+                        soundStatus = "Discord's built-in voice sounds could not load. Restart Discord and try again.";
                         vendetta.logger.warn("Voice Notices could not prepare sound", error);
                         return;
                     }
                     if (!active) return release(soundIds[event]);
                     prepared.add(soundIds[event]);
                     ready.add(event);
-                    if (ready.size === 2) soundStatus = "Notification sounds are ready.";
+                    if (ready.size === 2) soundStatus = "Built-in voice sounds are ready. Use Test join sound to check your call volume.";
                 });
             } catch (error) {
                 soundStatus = "Sound could not load. Text notices still work.";

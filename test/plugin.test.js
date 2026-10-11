@@ -11,9 +11,9 @@ const { before, instead } = patcher;
 const output = await build({ entryPoints: ["src/index.jsx"], bundle: true, write: false, format: "iife", globalName: "voiceNotices", jsxFactory: "React.createElement", jsxFragment: "React.Fragment" });
 const source = `(() => {${output.outputFiles[0].text}; return voiceNotices.default;})()`;
 
-function harness({ withSound = true, deferSound = false, withPrototype = true } = {}) {
+function harness({ withSound = true, deferSound = false, withPrototype = true, withMetadata = true, prepareError = null } = {}) {
     const handlers = new Map();
-    const toasts = [], played = [], stopped = [], released = [], timers = new Map(), callbacks = [], builtinPlayed = [];
+    const toasts = [], played = [], stopped = [], released = [], timers = new Map(), callbacks = [], builtinPlayed = [], preparedCalls = [];
     class MobileAudioSound {
         constructor(name) { this.name = name; }
         play() { builtinPlayed.push(this.name); }
@@ -25,14 +25,16 @@ function harness({ withSound = true, deferSound = false, withPrototype = true } 
     const storage = {};
     const sound = {
         prepare(url, category, id, callback) {
-            if (url.startsWith("https://example.com/")) {
-                assert.match(url, /^https:\/\/example.com\/voice-notices\/(join|leave)\.wav$/);
-                assert.equal(category, "notification");
+            preparedCalls.push({ name: url, usage: category, id });
+            if (id >= 1_000_000_000) {
+                assert.ok(["user_join", "user_leave"].includes(url));
+                assert.equal(category, "voice");
             }
             assert.equal(Number.isInteger(id), true);
             assert.ok(id > 0 && id < 2147483647);
-            if (deferSound) callbacks.push(() => callback(null, { duration: 0.16 }));
-            else callback(null, { duration: 0.16 });
+            const finish = () => callback(prepareError, withMetadata ? { duration: 0.16 } : undefined);
+            if (deferSound) callbacks.push(finish);
+            else finish();
         },
         play: id => played.push(id), stop: id => stopped.push(id), release: id => released.push(id)
     };
@@ -44,13 +46,17 @@ function harness({ withSound = true, deferSound = false, withPrototype = true } 
     };
     const plugin = vm.runInNewContext(source, {
         vendetta: {
-            metro: { common: { React: {}, ReactNative: { NativeModules: withSound ? { DCDSoundManager: sound } : {} }, FluxDispatcher: {
+            metro: { common: { React: {
+                createElement: (type, props, ...children) => typeof type === "function" ? type({ ...props, children }) : { type, props: { ...props, children } },
+                useState: value => [value, () => {}]
+            }, ReactNative: { NativeModules: withSound ? { DCDSoundManager: sound } : {} }, FluxDispatcher: {
                 subscribe: (event, handler) => { assert.equal(handlers.has(event), false); handlers.set(event, handler); },
                 unsubscribe: (event, handler) => { if (handlers.get(event) === handler) handlers.delete(event); }
             } }, findByStoreName: name => stores[name], findByProps: () => withPrototype ? { MobileAudioSound } : undefined },
             patcher: { before, instead },
-            plugin: { storage, id: "https://example.com/voice-notices/", manifest: { version: "1.1.0" } },
-            ui: { components: { Forms: {} }, toasts: { showToast: text => toasts.push(text) } },
+            plugin: { storage, id: "https://example.com/voice-notices/", manifest: { version: "1.2.0" } },
+            storage: { useProxy() {} },
+            ui: { components: { Forms: Object.fromEntries(["FormRow", "FormSection", "FormSwitchRow", "FormInput", "FormText"].map(name => [name, name])) }, toasts: { showToast: text => toasts.push(text) } },
             logger: { warn() {}, error() {} }
         },
         setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
@@ -58,8 +64,82 @@ function harness({ withSound = true, deferSound = false, withPrototype = true } 
     });
     const dispatch = (event, payload = {}) => handlers.get(event)?.(payload);
     const flush = () => { for (const [id, callback] of [...timers]) { timers.delete(id); callback(); } };
-    return { plugin, storage, toasts, played, stopped, released, handlers, dispatch, flush, callbacks, stores, sound, MobileAudioSound, cachedJoin, builtinPlayed };
+    const rows = () => {
+        const found = [];
+        function visit(node) {
+            if (!node || typeof node !== "object") return;
+            if (Array.isArray(node)) return node.forEach(visit);
+            if (node.type === "FormRow") found.push(node.props);
+            visit(node.props?.children);
+        }
+        visit(plugin.settings());
+        return found;
+    };
+    return { plugin, storage, toasts, played, stopped, released, handlers, dispatch, flush, callbacks, stores, sound, MobileAudioSound, cachedJoin, builtinPlayed, preparedCalls, rows };
 }
+
+test("regression: sounds use bundled Discord resources on the voice audio route", () => {
+    const h = harness();
+    h.plugin.onLoad();
+    assert.deepEqual(h.preparedCalls.map(({ name, usage }) => ({ name, usage })), [
+        { name: "user_join", usage: "voice" }, { name: "user_leave", usage: "voice" }
+    ]);
+    h.storage.others.sound = true;
+    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
+    assert.deepEqual(h.played, [h.preparedCalls[1].id]);
+    h.plugin.onUnload();
+});
+
+test("regression: switching sound off, on, and off again works without restarting", () => {
+    const h = harness();
+    h.plugin.onLoad();
+    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
+    assert.equal(h.played.length, 0);
+    h.storage.others.sound = true;
+    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: "a" }] });
+    assert.deepEqual(h.played, [h.preparedCalls[0].id]);
+    h.storage.others.sound = false;
+    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "friend", channelId: null }] });
+    assert.equal(h.played.length, 1);
+    h.plugin.onUnload();
+});
+
+test("regression: successful preparation without metadata still enables sound", () => {
+    const h = harness({ withMetadata: false });
+    h.plugin.onLoad();
+    h.storage.self.sound = true;
+    h.dispatch("VOICE_STATE_UPDATES", { voiceStates: [{ userId: "me", channelId: null }] });
+    assert.deepEqual(h.played, [h.preparedCalls[1].id]);
+    h.plugin.onUnload();
+});
+
+test("regression: settings test buttons bypass muted preferences but not the readiness check", () => {
+    const h = harness({ deferSound: true });
+    h.plugin.onLoad();
+    const join = h.rows().find(row => row.label === "Test join sound");
+    join.onPress();
+    assert.equal(h.played.length, 0);
+    assert.match(h.toasts.at(-1), /Loading/);
+    h.callbacks.forEach(callback => callback());
+    join.onPress();
+    h.rows().find(row => row.label === "Test leave sound").onPress();
+    assert.deepEqual(h.played, h.preparedCalls.map(call => call.id));
+    assert.equal(h.storage.self.sound, false);
+    assert.equal(h.storage.others.sound, false);
+    h.plugin.onUnload();
+    join.onPress();
+    assert.equal(h.played.length, 2);
+    assert.match(h.toasts.at(-1), /not enabled/);
+});
+
+test("regression: failed preparation is visible from the sound test button", () => {
+    const h = harness({ prepareError: "Resource unavailable" });
+    h.plugin.onLoad();
+    h.rows().find(row => row.label === "Test join sound").onPress();
+    assert.equal(h.played.length, 0);
+    assert.match(h.toasts.at(-1), /could not load/);
+    h.plugin.onUnload();
+});
 
 test("regression: cached Discord voice sounds are blocked, unrelated sounds are preserved", async () => {
     const h = harness();
@@ -204,15 +284,9 @@ test("integration: missing required stores fail before registering listeners", (
     assert.equal(h.handlers.size, 0);
 });
 
-test("build: manifest hash and generated WAV headers are valid", async () => {
+test("build: manifest hash is valid and audio uses no remote files", async () => {
     const manifest = JSON.parse(await readFile("dist/manifest.json", "utf8"));
     const bundle = await readFile("dist/index.js");
     assert.equal(manifest.hash, createHash("sha256").update(bundle).digest("hex"));
-    for (const name of ["join", "leave"]) {
-        const wav = await readFile(`dist/${name}.wav`);
-        assert.equal(wav.toString("ascii", 0, 4), "RIFF");
-        assert.equal(wav.toString("ascii", 8, 12), "WAVE");
-        assert.equal(wav.readUInt32LE(4), wav.length - 8);
-        assert.equal(wav.readUInt32LE(40), wav.length - 44);
-    }
+    assert.doesNotMatch(bundle.toString(), /join\.wav|leave\.wav/);
 });

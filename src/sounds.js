@@ -6,7 +6,7 @@ export function isVoiceSound(name) {
     return voiceSound.test(filename);
 }
 
-export function installVoiceSoundGuard(api) {
+export function installVoiceSoundGuard(api, allowedKeys = new Set()) {
     const unpatch = [];
     const names = new Map();
     let blocked = 0;
@@ -34,7 +34,7 @@ export function installVoiceSoundGuard(api) {
         const native = api.metro.common.ReactNative.NativeModules.DCDSoundManager;
         if (["prepare", "play", "release"].every(method => typeof native?.[method] === "function")) {
             unpatch.push(api.patcher.before("prepare", native, ([name, , key]) => {
-                if (isVoiceSound(name)) names.set(key, name);
+                if (!allowedKeys.has(key) && isVoiceSound(name)) names.set(key, name);
                 else names.delete(key);
             }));
             unpatch.push(api.patcher.instead("play", native, (args, original) => {
